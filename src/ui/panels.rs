@@ -135,6 +135,7 @@ pub enum UiAction {
     CancelAnalysis,
     ExportVir,
     ClearAnalysisCache,
+    ExportThumbnail,
     TestModelConnection,
     GenerateEmbeddings,
     CancelEmbeddings,
@@ -1058,7 +1059,64 @@ struct PreviewResizeGrab {
     start_font_size: f32,
 }
 
+/// Mouse wheel (Line/Page) over the timeline pans the time axis horizontally instead of
+/// scrolling the layer list vertically. Trackpad (Point) deltas are left alone so two-finger
+/// scrolling still moves layers.
+///
+/// `InputState::wheel` is private in egui, so the multi-frame smoothing buffer cannot be
+/// rotated at the source. Instead a short-lived temp flag keeps rotating the per-frame
+/// `smooth_scroll_delta` snapshot while that buffer drains (a few frames per notch).
+fn rotate_mouse_wheel_to_horizontal(ui: &mut Ui) {
+    let rotate_id = Id::new("timeline-wheel-horizontal");
+    let time = ui.input(|input| input.time);
+    let (wheel_event, trackpad_event) = ui.input(|input| {
+        let mut wheel = false;
+        let mut trackpad = false;
+        for event in &input.raw.events {
+            if let egui::Event::MouseWheel { unit, .. } = event {
+                match unit {
+                    egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page => wheel = true,
+                    egui::MouseWheelUnit::Point => trackpad = true,
+                }
+            }
+        }
+        (wheel, trackpad)
+    });
+    // Ctrl/Cmd+wheel is global zoom; do not steal it or its leftover smoothing.
+    if ui.input(|input| input.modifiers.matches_any(egui::Modifiers::COMMAND)) {
+        ui.data_mut(|data| {
+            data.remove_temp::<f64>(rotate_id);
+        });
+        return;
+    }
+    if wheel_event {
+        ui.data_mut(|data| {
+            data.insert_temp(rotate_id, time);
+        });
+    } else if trackpad_event {
+        // A trackpad gesture takes over: keep its native vertical behaviour.
+        ui.data_mut(|data| {
+            data.remove_temp::<f64>(rotate_id);
+        });
+        return;
+    } else {
+        let draining = ui
+            .data(|data| data.get_temp::<f64>(rotate_id))
+            .is_some_and(|since| time - since < 0.30);
+        if !draining {
+            return;
+        }
+    }
+    ui.input_mut(|input| {
+        input.smooth_scroll_delta.x += input.smooth_scroll_delta.y;
+        input.smooth_scroll_delta.y = 0.0;
+    });
+}
+
 fn timeline_panel(ui: &mut Ui, context: &mut PanelContext<'_>) {
+    if ui.rect_contains_pointer(ui.max_rect()) {
+        rotate_mouse_wheel_to_horizontal(ui);
+    }
     ui.horizontal(|ui| {
         if ui
             .button("＋レイヤー")
@@ -1134,6 +1192,17 @@ fn timeline_panel(ui: &mut Ui, context: &mut PanelContext<'_>) {
                     });
             });
         });
+
+    ui.separator();
+    ui.horizontal(|ui| {
+        if ui
+            .button("🖼 サムネ出力")
+            .on_hover_text("現在の再生位置のフレームを samune.png として書き出す")
+            .clicked()
+        {
+            context.actions.push(UiAction::ExportThumbnail);
+        }
+    });
 }
 
 fn layer_header_row(ui: &mut Ui, context: &mut PanelContext<'_>, layer: &Layer) {

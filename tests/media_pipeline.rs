@@ -61,6 +61,7 @@ fn image_preview_succeeds_even_when_qsv_is_requested() {
         for use_qsv in [false, true] {
             let preview = PreviewWorker::spawn(|| {});
             preview.request_batch(vec![PreviewRequest {
+                request_seq: 1,
                 generation: 1,
                 clip_id: Uuid::new_v4(),
                 path: source.clone(),
@@ -77,12 +78,78 @@ fn image_preview_succeeds_even_when_qsv_is_requested() {
                 frame
             });
             assert!(
-                frame.is_some_and(|frame| frame.error.is_none() && !frame.rgb.is_empty()),
+                frame.is_some_and(|frame| frame.error.is_none() && !frame.pixels.is_empty()),
                 "{} with use_qsv={use_qsv} should produce a preview frame",
                 source.display()
             );
         }
     }
+
+    let _ = fs::remove_dir_all(directory);
+}
+
+/// A portrait still fitted into the 16:9 preview frame must be letterboxed with zero alpha.
+/// An opaque pad would draw a 16:9 black box over the clips underneath, which is exactly the
+/// "the image is forced to 16:9 and gets huge margins" symptom.
+#[test]
+fn image_preview_letterbox_is_transparent() {
+    if Command::new("ffmpeg").arg("-version").output().is_err() {
+        eprintln!("FFmpeg is unavailable; skipping letterbox test");
+        return;
+    }
+    let directory = std::env::temp_dir().join(format!("yuki-preview-letterbox-{}", Uuid::new_v4()));
+    fs::create_dir_all(&directory).unwrap();
+    let png = directory.join("portrait.png");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=180x320:rate=30",
+            "-frames:v",
+            "1",
+        ])
+        .arg(&png)
+        .status()
+        .unwrap();
+    assert!(generated.success());
+
+    let (width, height) = PowerProfile::Eco.dimensions();
+    let preview = PreviewWorker::spawn(|| {});
+    preview.request_batch(vec![PreviewRequest {
+        request_seq: 1,
+        generation: 1,
+        clip_id: Uuid::new_v4(),
+        path: png,
+        source_time: TimelineTime::ZERO,
+        profile: PowerProfile::Eco,
+        use_qsv: false,
+        is_image: true,
+    }]);
+    let frame = (0..100).find_map(|_| {
+        let frame = preview.try_frames().into_iter().next();
+        if frame.is_none() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        frame
+    });
+    let frame = frame.expect("portrait image should decode into a preview frame");
+    assert!(frame.error.is_none(), "{:?}", frame.error);
+    assert_eq!(
+        frame.pixels.len(),
+        width as usize * height as usize * 4,
+        "preview frames are RGBA"
+    );
+    let alpha_at = |x: usize, y: usize| frame.pixels[(y * width as usize + x) * 4 + 3];
+    // The side margins of the portrait source: transparent, not an opaque black bar.
+    assert_eq!(alpha_at(0, height as usize / 2), 0);
+    assert_eq!(alpha_at(width as usize - 1, height as usize / 2), 0);
+    // The picture itself still covers the centre, at its own aspect ratio.
+    assert_eq!(alpha_at(width as usize / 2, height as usize / 2), 255);
 
     let _ = fs::remove_dir_all(directory);
 }
@@ -132,6 +199,7 @@ fn ffmpeg_probe_and_export_round_trip() {
 
     let preview = PreviewWorker::spawn(|| {});
     preview.request_batch(vec![PreviewRequest {
+        request_seq: 1,
         generation: 1,
         clip_id: Uuid::new_v4(),
         path: source.clone(),
@@ -147,7 +215,7 @@ fn ffmpeg_probe_and_export_round_trip() {
         }
         frame
     });
-    assert!(first_frame.is_some_and(|frame| frame.error.is_none() && !frame.rgb.is_empty()));
+    assert!(first_frame.is_some_and(|frame| frame.error.is_none() && !frame.pixels.is_empty()));
 
     let mut project = Project::new("integration");
     project.sequence.settings.width = 320;
@@ -382,6 +450,7 @@ fn still_image_imports_previews_and_exports() {
     // The still frame can be previewed without seeking (the decoder loops the image).
     let preview = PreviewWorker::spawn(|| {});
     preview.request_batch(vec![PreviewRequest {
+        request_seq: 1,
         generation: 1,
         clip_id: Uuid::new_v4(),
         path: source.clone(),
@@ -397,7 +466,7 @@ fn still_image_imports_previews_and_exports() {
         }
         frame
     });
-    assert!(first_frame.is_some_and(|frame| frame.error.is_none() && !frame.rgb.is_empty()));
+    assert!(first_frame.is_some_and(|frame| frame.error.is_none() && !frame.pixels.is_empty()));
 
     let mut project = Project::new("image");
     project.sequence.settings.width = 320;
@@ -505,6 +574,7 @@ fn heic_image_imports_and_exports_when_a_converter_is_available() {
 
     let preview = PreviewWorker::spawn(|| {});
     preview.request_batch(vec![PreviewRequest {
+        request_seq: 1,
         generation: 1,
         clip_id: Uuid::new_v4(),
         path: heic.clone(),
@@ -520,7 +590,7 @@ fn heic_image_imports_and_exports_when_a_converter_is_available() {
         }
         frame
     });
-    assert!(first_frame.is_some_and(|frame| frame.error.is_none() && !frame.rgb.is_empty()));
+    assert!(first_frame.is_some_and(|frame| frame.error.is_none() && !frame.pixels.is_empty()));
 
     let mut project = Project::new("heic");
     project.sequence.settings.width = 320;
@@ -613,6 +683,7 @@ fn tiled_heic_still_is_flattened_before_decoding() {
     // tiled file to its flattened PNG, so exercise that exact path here.
     let preview = PreviewWorker::spawn(|| {});
     preview.request_batch(vec![PreviewRequest {
+        request_seq: 1,
         generation: 1,
         clip_id: Uuid::new_v4(),
         path: heic.clone(),
@@ -628,7 +699,7 @@ fn tiled_heic_still_is_flattened_before_decoding() {
         }
         frame
     });
-    assert!(first_frame.is_some_and(|frame| frame.error.is_none() && !frame.rgb.is_empty()));
+    assert!(first_frame.is_some_and(|frame| frame.error.is_none() && !frame.pixels.is_empty()));
 
     let _ = fs::remove_dir_all(directory);
     let _ = fs::remove_file(decodable);

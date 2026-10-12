@@ -691,11 +691,21 @@ fn push_clip_video_filters(
     composed
 }
 
-fn render(
-    project: &Project,
-    destination: &Path,
-    options: ExportOptions,
-) -> Result<(), ExportError> {
+/// FFmpeg inputs and the video filter graph, shared by the MP4 render and the single-frame
+/// PNG export so both composite clips, text and shapes identically.
+struct Composition<'a> {
+    /// Every clip on the timeline, including hidden layers (their audio may still be mixed).
+    clip_entries: Vec<(&'a Layer, &'a Clip)>,
+    /// One FFmpeg input per distinct asset, in stable layer/item order.
+    inputs: Vec<&'a MediaAsset>,
+    input_index: HashMap<AssetId, usize>,
+    /// `filter_complex` fragments; [`Self::final_video`] is the last video label in the chain.
+    filters: Vec<String>,
+    final_video: String,
+    duration: f64,
+}
+
+fn build_composition(project: &Project) -> Result<Composition<'_>, ExportError> {
     let settings = &project.sequence.settings;
     let duration = project.duration().as_seconds().max(0.001);
 
@@ -736,23 +746,6 @@ fn render(
             entry.insert(inputs.len());
             inputs.push(asset);
         }
-    }
-
-    let mut command = Command::new("nice");
-    command.args(["-n", "5", "ffmpeg", "-hide_banner", "-y", "-nostdin"]);
-    for asset in &inputs {
-        // A still image supplies a single frame; looping it turns it into a continuous stream so
-        // the clip's `trim` can pick any source range. The right loop flag depends on the format
-        // (see `media::image`), and a container this FFmpeg cannot decode is converted first.
-        let path = if asset.metadata.is_image {
-            ensure_decodable_image(&asset.path)
-        } else {
-            asset.path.clone()
-        };
-        if asset.metadata.is_image {
-            command.args(image_loop_input_args(&path, settings.frame_rate));
-        }
-        command.arg("-i").arg(&path);
     }
 
     let mut filters = Vec::new();
@@ -879,6 +872,53 @@ fn render(
         }
     }
 
+    Ok(Composition {
+        clip_entries,
+        inputs,
+        input_index,
+        filters,
+        final_video: previous_video,
+        duration,
+    })
+}
+
+/// Appends one FFmpeg `-i` per distinct asset. Stills are looped so any source range works.
+fn push_input_args(command: &mut Command, inputs: &[&MediaAsset], settings: &SequenceSettings) {
+    for asset in inputs {
+        // A still image supplies a single frame; looping it turns it into a continuous stream so
+        // the clip's `trim` can pick any source range. The right loop flag depends on the format
+        // (see `media::image`), and a container this FFmpeg cannot decode is converted first.
+        let path = if asset.metadata.is_image {
+            ensure_decodable_image(&asset.path)
+        } else {
+            asset.path.clone()
+        };
+        if asset.metadata.is_image {
+            command.args(image_loop_input_args(&path, settings.frame_rate));
+        }
+        command.arg("-i").arg(&path);
+    }
+}
+
+fn render(
+    project: &Project,
+    destination: &Path,
+    options: ExportOptions,
+) -> Result<(), ExportError> {
+    let Composition {
+        clip_entries,
+        inputs,
+        input_index,
+        mut filters,
+        final_video,
+        duration,
+    } = build_composition(project)?;
+    let settings = &project.sequence.settings;
+
+    let mut command = Command::new("nice");
+    command.args(["-n", "5", "ffmpeg", "-hide_banner", "-y", "-nostdin"]);
+    push_input_args(&mut command, &inputs, settings);
+
     // Only build the audio graph when audio will actually be muxed; otherwise FFmpeg rejects
     // the unconnected `[aout]` output of the mixing filter.
     if options.audio_codec != AudioCodec::None {
@@ -933,7 +973,7 @@ fn render(
             audio_labels.len()
         ));
     }
-    filters.push(format!("[{previous_video}]trim=duration={duration}[vout]"));
+    filters.push(format!("[{final_video}]trim=duration={duration}[vout]"));
 
     let temporary = temporary_path(destination);
     command.args(["-filter_complex", &filters.join(";")]);
@@ -964,6 +1004,56 @@ fn render(
         .arg(options.threads.max(1).to_string())
         .args(["-movflags", "+faststart"])
         .arg(&temporary);
+
+    let output = command.output()?;
+    if !output.status.success() {
+        let _ = fs::remove_file(&temporary);
+        return Err(ExportError::Ffmpeg(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    fs::rename(&temporary, destination)?;
+    Ok(())
+}
+
+/// Renders the composited frame at `time_sec` (clips + text + shapes) to `destination` as a
+/// single PNG. Uses the same filter graph as [`render`], so the thumbnail matches the MP4.
+/// No audio. Overwrites `destination` in place.
+pub fn export_frame_png(
+    project: &Project,
+    time_sec: f64,
+    destination: &Path,
+) -> Result<(), ExportError> {
+    let Composition {
+        inputs,
+        mut filters,
+        final_video,
+        duration,
+        ..
+    } = build_composition(project)?;
+    let settings = &project.sequence.settings;
+
+    let mut command = Command::new("nice");
+    command.args(["-n", "5", "ffmpeg", "-hide_banner", "-y", "-nostdin"]);
+    push_input_args(&mut command, &inputs, settings);
+
+    // Keep the single output frame that covers the requested time. The one-frame window is
+    // clamped inside the timeline so a playhead parked at the very end still resolves.
+    let frame_dur = 1.0 / settings.frame_rate.max(1.0);
+    let t = time_sec.clamp(0.0, (duration - frame_dur).max(0.0));
+    filters.push(format!(
+        "[{final_video}]trim=start={t:.6}:end={:.6},setpts=PTS-STARTPTS[vout]",
+        t + frame_dur
+    ));
+
+    let mut temporary_os = destination.as_os_str().to_os_string();
+    temporary_os.push(".part.png");
+    let temporary = PathBuf::from(temporary_os);
+
+    command.args(["-filter_complex", &filters.join(";")]);
+    command.args(["-map", "[vout]", "-frames:v", "1", "-an"]);
+    command.args(["-c:v", "png", "-f", "image2"]);
+    command.arg(&temporary);
 
     let output = command.output()?;
     if !output.status.success() {

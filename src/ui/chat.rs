@@ -177,22 +177,34 @@ fn composer(ui: &mut Ui, analysis: &mut AnalysisState, actions: &mut Vec<UiActio
     let chat = &mut analysis.chat;
     let has_analysis = analysis.result.is_some();
     ui.horizontal(|ui| {
-        let response = ui.add_enabled(
-            !chat.is_waiting(),
-            egui::TextEdit::singleline(&mut chat.input)
-                .hint_text("どんな動画にしたいか入力…")
-                .desired_width(320.0),
-        );
+        // The box stays typeable while the agent works: only sending is blocked. Disabling it
+        // as well would make the input dead for as long as a job runs (or hangs).
+        let response = ui
+            .add(
+                egui::TextEdit::singleline(&mut chat.input)
+                    // A stable id keeps focus (and the IME) across layout changes.
+                    .id_salt("chat_input")
+                    .hint_text("どんな動画にしたいか入力…")
+                    .desired_width(320.0),
+            )
+            .on_hover_text("Escで入力リセット（IMEが文字を渡さなくなったとき）");
         let submitted =
             response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        // Esc blurs the field; taking the focus back in the same frame forces a one-frame IME
+        // disable/enable cycle — the no-restart fix for an IME that stopped committing text.
+        let reset_input = response.ctx.memory(|memory| {
+            memory.had_focus_last_frame(response.id)
+                && ui.input(|input| input.key_pressed(egui::Key::Escape))
+        });
         let can_send = !chat.is_waiting() && !chat.input.trim().is_empty();
-        if (submitted
-            || ui
-                .add_enabled(can_send, egui::Button::new("送信"))
-                .clicked())
-            && can_send
-        {
+        let clicked = ui
+            .add_enabled(can_send, egui::Button::new("送信"))
+            .clicked();
+        if (submitted || clicked) && can_send {
             actions.push(UiAction::SendChat);
+        }
+        if (submitted || clicked || reset_input) && !response.has_focus() {
+            response.request_focus();
         }
         if ui
             .add_enabled(chat.is_waiting(), egui::Button::new("■ 中止"))

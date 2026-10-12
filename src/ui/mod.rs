@@ -5,6 +5,7 @@ mod model_config;
 mod monitor;
 mod panels;
 mod semantic;
+mod theme;
 
 pub use analysis::{AnalysisErrorView, AnalysisState, AnalysisStatus};
 pub use chat::{ChatState, ChatStatus};
@@ -12,3 +13,4 @@ pub use file_browser::FileBrowserState;
 pub use monitor::WaveformCache;
 pub use panels::{EditorTab, PanelContext, PreviewGalleyCache, UiAction, create_default_dock};
 pub use semantic::{EmbeddingStatus, ProbeStatus, SemanticState};
+pub use theme::{AppTheme, build_visuals, roll_random_seed};

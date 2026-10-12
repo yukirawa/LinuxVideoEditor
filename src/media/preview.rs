@@ -50,6 +50,12 @@ const DECODER_IDLE_PARK: Duration = Duration::from_millis(2_500);
 
 #[derive(Clone, Debug)]
 pub struct PreviewRequest {
+    /// Monotonic id of this request. Used to drop frames older than a newer request, so a
+    /// slow decode cannot overwrite a fresher frame while the user is scrubbing.
+    pub request_seq: u64,
+    /// Invalidates in-flight frames when the project structure changes (import/edit/undo).
+    /// Deliberately NOT bumped on playhead moves: that would tear down the warm FFmpeg
+    /// decoder on every scrub step and make the preview lag a beat behind the playhead.
     pub generation: u64,
     /// The timeline clip this frame is for. One decoder is kept per visible clip so several
     /// layers can composite at once.
@@ -73,11 +79,14 @@ impl PreviewRequest {
 
 #[derive(Debug)]
 pub struct PreviewFrame {
+    pub request_seq: u64,
     pub generation: u64,
     pub clip_id: ClipId,
     pub width: usize,
     pub height: usize,
-    pub rgb: Vec<u8>,
+    /// Straight-alpha RGBA bytes (`width * height * 4`); alpha is what keeps the letterbox of a
+    /// non-16:9 source from covering the layers underneath.
+    pub pixels: Vec<u8>,
     pub qsv_active: bool,
     pub error: Option<String>,
 }
@@ -85,7 +94,7 @@ pub struct PreviewFrame {
 pub struct PreviewWorker {
     requests: Sender<Vec<PreviewRequest>>,
     frames: Receiver<PreviewFrame>,
-    /// Decoded RGB buffers returned by the UI thread, so the decoder can reuse their
+    /// Decoded frame buffers returned by the UI thread, so the decoder can reuse their
     /// allocations instead of allocating a fresh multi-megabyte buffer for every frame.
     recycle: Sender<Vec<u8>>,
 }
@@ -157,7 +166,7 @@ impl PreviewWorker {
 
                         let read = decoders
                             .get_mut(&request.clip_id)
-                            .map(|active| active.read_frame_at(request.source_time, &mut buffer_pool));
+                            .map(|active| active.read_frame_at(&request, &mut buffer_pool));
                         let frame = match read {
                             Some(Ok(frame)) => frame,
                             Some(Err(_)) if hardware => {
@@ -166,7 +175,7 @@ impl PreviewWorker {
                                 let retry = match software {
                                     Some(mut active) => {
                                         let frame =
-                                            active.read_frame_at(request.source_time, &mut buffer_pool);
+                                            active.read_frame_at(&request, &mut buffer_pool);
                                         decoders.insert(request.clip_id, active);
                                         Some(frame)
                                     }
@@ -217,7 +226,7 @@ impl PreviewWorker {
         frames
     }
 
-    /// Give a consumed frame's RGB buffer back to the decoder. The UI thread calls this once it
+    /// Give a consumed frame's pixel buffer back to the decoder. The UI thread calls this once it
     /// has copied the pixels into a texture.
     pub fn recycle(&self, buffer: Vec<u8>) {
         let _ = self.recycle.send(buffer);
@@ -228,11 +237,12 @@ impl PreviewFrame {
     fn error(request: &PreviewRequest, message: impl Into<String>) -> Self {
         let (width, height) = request.profile.dimensions();
         Self {
+            request_seq: request.request_seq,
             generation: request.generation,
             clip_id: request.clip_id,
             width: width as usize,
             height: height as usize,
-            rgb: Vec::new(),
+            pixels: Vec::new(),
             qsv_active: false,
             error: Some(message.into()),
         }
@@ -258,7 +268,6 @@ struct ContinuousDecoder {
     /// The timeline clip these frames belong to; echoed on every [`PreviewFrame`].
     clip_id: ClipId,
     path: PathBuf,
-    generation: u64,
     profile: PowerProfile,
     next_source_time: TimelineTime,
     qsv_active: bool,
@@ -279,11 +288,15 @@ impl ContinuousDecoder {
         let use_qsv = use_qsv && !request.is_image;
         let (width, height) = request.profile.dimensions();
         let fps = request.profile.preview_fps();
+        // The letterbox is transparent, not black: the monitor paints this frame as the clip's
+        // own box, so an opaque pad would draw a 16:9 black rectangle over the layers below and
+        // make a portrait screenshot look squeezed into a frame it never had. The export has no
+        // pad (scale + overlay), so transparent margins are what the rendered video shows too.
         let scale_pad = format!(
-            "scale=w={width}:h={height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
+            "scale=w={width}:h={height}:force_original_aspect_ratio=decrease,format=rgba,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black@0.0"
         );
         let software_filter = format!("{scale_pad},fps={fps}");
-        let qsv_filter = format!("hwdownload,format=nv12,{scale_pad},format=rgb24,fps={fps}");
+        let qsv_filter = format!("hwdownload,format=nv12,{scale_pad},format=rgba,fps={fps}");
         let mut command = Command::new("nice");
         command.args([
             "-n",
@@ -328,7 +341,7 @@ impl ContinuousDecoder {
             command.args(["-fps_mode", "cfr"]);
         }
         command
-            .args(["-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"])
+            .args(["-pix_fmt", "rgba", "-f", "rawvideo", "pipe:1"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -342,7 +355,6 @@ impl ContinuousDecoder {
             stdout: BufReader::new(stdout),
             clip_id: request.clip_id,
             path: request.path.clone(),
-            generation: request.generation,
             profile: request.profile,
             next_source_time: request.source_time,
             qsv_active: use_qsv,
@@ -405,9 +417,10 @@ impl ContinuousDecoder {
     }
 
     fn can_continue(&self, request: &PreviewRequest) -> bool {
-        let same_source = self.path == request.path
-            && self.generation == request.generation
-            && self.profile == request.profile;
+        // Generation is deliberately NOT part of the key: a playhead move must not tear the
+        // warm decoder down, or scrubbing lags one decode behind (the old bug). Structural
+        // changes get a new clip set / source mapping, which the drift check below catches.
+        let same_source = self.path == request.path && self.profile == request.profile;
         if !same_source {
             return false;
         }
@@ -422,21 +435,23 @@ impl ContinuousDecoder {
 
     fn read_frame_at(
         &mut self,
-        requested_time: TimelineTime,
+        request: &PreviewRequest,
         pool: &mut Vec<Vec<u8>>,
     ) -> std::io::Result<PreviewFrame> {
-        let frame_size = self.width * self.height * 3;
+        let requested_time = request.source_time;
+        // RGBA, not RGB: the letterbox pad carries a zero alpha (see `ContinuousDecoder::spawn`).
+        let frame_size = self.width * self.height * 4;
         // Reuse a recycled buffer when possible; `read_exact`/`copy_from_slice` fill it fully.
-        let mut rgb = pool.pop().unwrap_or_default();
-        rgb.resize(frame_size, 0);
+        let mut pixels = pool.pop().unwrap_or_default();
+        pixels.resize(frame_size, 0);
         if self.is_image {
             // The still is decoded once; every later request is served from the cached frame, so a
             // long clip costs one decode no matter how the playhead moves.
             if let Some(still) = &self.still {
-                rgb.copy_from_slice(still);
+                pixels.copy_from_slice(still);
             } else {
-                self.stdout.read_exact(&mut rgb)?;
-                self.still = Some(rgb.clone());
+                self.stdout.read_exact(&mut pixels)?;
+                self.still = Some(pixels.clone());
                 // The image path runs FFmpeg with `-frames:v 1`, so it exits after this frame.
                 // Reap it immediately instead of leaving a zombie until Drop.
                 let _ = self.child.wait();
@@ -449,20 +464,21 @@ impl ContinuousDecoder {
                 .floor()
                 .clamp(0.0, 8.0) as usize;
             for _ in 0..frames_to_skip {
-                self.stdout.read_exact(&mut rgb)?;
+                self.stdout.read_exact(&mut pixels)?;
                 self.next_source_time =
                     self.next_source_time + TimelineTime::from_seconds(frame_seconds);
             }
-            self.stdout.read_exact(&mut rgb)?;
+            self.stdout.read_exact(&mut pixels)?;
             self.next_source_time =
                 self.next_source_time + TimelineTime::from_seconds(frame_seconds);
         }
         Ok(PreviewFrame {
-            generation: self.generation,
+            request_seq: request.request_seq,
+            generation: request.generation,
             clip_id: self.clip_id,
             width: self.width,
             height: self.height,
-            rgb,
+            pixels,
             qsv_active: self.qsv_active,
             error: None,
         })

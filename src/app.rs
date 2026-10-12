@@ -12,7 +12,8 @@ use crate::knowledge::{
 };
 use crate::media::{
     AudioPreview, ExportOptions, HardwareCapabilities, IMAGE_EXTENSIONS, PowerProfile,
-    PreviewRequest, PreviewWorker, detect_hardware_capabilities, export_project_with_options,
+    PreviewRequest, PreviewWorker, detect_hardware_capabilities, export_frame_png,
+    export_project_with_options,
     fallback_font_families, list_font_families, preview_font_key, probe_media, resolve_font_file,
     synthesize,
     voicevox_cache_dir,
@@ -21,9 +22,9 @@ use crate::models::{ModelConfig, ModelError, OpenAiCompatible, ProbeResult};
 use crate::project_store;
 use crate::protocol::{AiError, AiImage, AiToolCall, AiToolResponse, validate_aep};
 use crate::ui::{
-    AnalysisErrorView, AnalysisState, AnalysisStatus, ChatStatus, EmbeddingStatus, EditorTab,
-    FileBrowserState, PanelContext, PreviewGalleyCache, ProbeStatus, UiAction, WaveformCache,
-    create_default_dock,
+    AnalysisErrorView, AnalysisState, AnalysisStatus, AppTheme, ChatStatus, EmbeddingStatus,
+    EditorTab, FileBrowserState, PanelContext, PreviewGalleyCache, ProbeStatus, UiAction,
+    WaveformCache, build_visuals, create_default_dock, roll_random_seed,
 };
 use eframe::egui::{
     self, ColorImage, Key, KeyboardShortcut, Modifiers, TextureHandle, TextureOptions,
@@ -48,6 +49,8 @@ pub struct VideoEditorApp {
     playing: bool,
     last_tick: Instant,
     preview_generation: u64,
+    preview_request_seq: u64,
+    preview_frame_seq: u64,
     last_preview_time: Option<TimelineTime>,
     /// Clip ids requested on the previous preview pass. A changed visible set (layer toggled,
     /// item moved) must bypass the playhead-delta throttle or the new clip would never appear.
@@ -110,6 +113,13 @@ pub struct VideoEditorApp {
     status: String,
     dirty: bool,
     export_result: Option<Receiver<Result<PathBuf, String>>>,
+    /// Single-frame thumbnail (`samune.png`) export running in the background. Independent of
+    /// `export_result` so a video export and a thumbnail export do not block each other.
+    thumbnail_result: Option<Receiver<Result<PathBuf, String>>>,
+    /// Selected UI theme and the `(hue, saturation)` that [`AppTheme::RandomColor`] was last
+    /// drawn from, so a restart restores the exact random palette.
+    app_theme: AppTheme,
+    random_theme_seed: (f32, f32),
     /// Phase 2 analysis workspace: target, options, progress, VIR result and thumbnail textures.
     analysis: AnalysisState,
     analysis_worker: Option<AnalysisWorker>,
@@ -161,6 +171,17 @@ impl VideoEditorApp {
         creation_context
             .egui_ctx
             .set_fonts(font_definitions.clone());
+        let app_theme: AppTheme = creation_context
+            .storage
+            .and_then(|storage| eframe::get_value(storage, "app_theme"))
+            .unwrap_or_default();
+        let random_theme_seed: (f32, f32) = creation_context
+            .storage
+            .and_then(|storage| eframe::get_value(storage, "random_theme_seed"))
+            .unwrap_or_else(roll_random_seed);
+        creation_context
+            .egui_ctx
+            .set_visuals(build_visuals(app_theme, random_theme_seed));
         configure_style(&creation_context.egui_ctx);
         let repaint_context = creation_context.egui_ctx.clone();
         let power_profile = creation_context
@@ -267,6 +288,8 @@ impl VideoEditorApp {
             playing: false,
             last_tick: Instant::now(),
             preview_generation: 0,
+            preview_request_seq: 0,
+            preview_frame_seq: 0,
             last_preview_time: None,
             last_requested_clips: Vec::new(),
             preview_main_clip: None,
@@ -303,6 +326,9 @@ impl VideoEditorApp {
             status: "準備完了".into(),
             dirty: false,
             export_result: None,
+            thumbnail_result: None,
+            app_theme,
+            random_theme_seed,
             analysis,
             analysis_worker: None,
             knowledge_receiver: Some(knowledge_rx),
@@ -590,6 +616,30 @@ impl VideoEditorApp {
                         context,
                     );
                 }
+            }
+        }
+    }
+
+    fn poll_thumbnail(&mut self) {
+        let Some(receiver) = &self.thumbnail_result else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(path)) => {
+                self.thumbnail_result = None;
+                self.status = format!(
+                    "{} を保存しました",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                );
+            }
+            Ok(Err(error)) => {
+                self.thumbnail_result = None;
+                self.status = format!("サムネの書き出しに失敗しました: {error}");
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.thumbnail_result = None;
+                self.status = "サムネの書き出しに失敗しました: ワーカーが終了しました".into();
             }
         }
     }
@@ -1587,6 +1637,53 @@ impl VideoEditorApp {
         self.status = "書き出し中…".into();
     }
 
+    /// Where the timeline thumbnail goes: next to a saved project, else the user's Videos
+    /// folder, else the temp directory. Same fallback as [`Self::default_export_path`].
+    fn thumbnail_export_path(&self) -> PathBuf {
+        let directory = self
+            .project_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Videos")))
+            .unwrap_or_else(std::env::temp_dir);
+        directory.join("samune.png")
+    }
+
+    /// Exports the composite frame at the playhead (clips + text + shapes) to `samune.png`.
+    fn export_thumbnail(&mut self, context: &egui::Context) {
+        if self.thumbnail_result.is_some() {
+            return;
+        }
+        if self
+            .project
+            .sequence
+            .layers
+            .iter()
+            .all(|layer| layer.items.is_empty())
+        {
+            self.status = "タイムラインが空のためサムネを書き出せません".into();
+            return;
+        }
+        let destination = self.thumbnail_export_path();
+        let project = self.project.clone();
+        let time_sec = self.playhead.as_seconds();
+        let repaint_context = context.clone();
+        let (tx, rx) = sync_channel(1);
+        std::thread::Builder::new()
+            .name("thumbnail-export".into())
+            .spawn(move || {
+                let result = export_frame_png(&project, time_sec, &destination)
+                    .map(|()| destination)
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(result);
+                repaint_context.request_repaint();
+            })
+            .expect("failed to start thumbnail export thread");
+        self.thumbnail_result = Some(rx);
+        self.status = "サムネを書き出し中…".into();
+    }
+
     /// Validates the proposed AEP against the current project and applies it as one undoable
     /// transaction (AEP-SPEC.md section 5).
     fn apply_chat_plan(&mut self) {
@@ -1773,7 +1870,9 @@ impl VideoEditorApp {
         }
         self.playing = !self.playing;
         self.last_tick = Instant::now();
-        self.preview_generation = self.preview_generation.wrapping_add(1);
+        // Playhead-only move: do NOT bump preview_generation. Bumping it here forced the warm
+        // FFmpeg decoder to restart on every play/pause, which is exactly the scrub lag we
+        // removed in seek_to. A structural generation bump is only for project edits.
         self.last_preview_time = None;
         self.request_preview();
         if self.playing {
@@ -1800,7 +1899,7 @@ impl VideoEditorApp {
         if self.playhead > self.project.duration() {
             self.playhead = self.project.duration();
         }
-        self.preview_generation = self.preview_generation.wrapping_add(1);
+        // Playhead-only move: keep the decoder warm (see seek_to).
         self.last_preview_time = None;
         self.request_preview();
     }
@@ -1809,7 +1908,9 @@ impl VideoEditorApp {
         self.playhead = time.max(TimelineTime::ZERO).min(self.project.duration());
         self.playing = false;
         self.audio_preview.stop();
-        self.preview_generation = self.preview_generation.wrapping_add(1);
+        // Deliberately no preview_generation bump: a playhead move must reuse the warm
+        // FFmpeg decoder. Bumping generation here made can_continue() fail on every scrub
+        // step, restarting the process and leaving the preview one beat behind the cursor.
         self.last_preview_time = None;
         self.request_preview();
     }
@@ -1907,6 +2008,8 @@ impl VideoEditorApp {
         self.preview_stills.retain(|id, _| visible_ids.contains(id));
 
         let mut batch = Vec::with_capacity(visible.len());
+        self.preview_request_seq = self.preview_request_seq.wrapping_add(1);
+        let request_seq = self.preview_request_seq;
         for clip in &visible {
             let Some(asset) = self.project.asset(clip.asset_id) else {
                 continue;
@@ -1930,6 +2033,7 @@ impl VideoEditorApp {
                     .insert(clip.id, (asset.id, self.power_profile));
             }
             batch.push(PreviewRequest {
+                request_seq,
                 generation: self.preview_generation,
                 clip_id: clip.id,
                 path: asset.path.clone(),
@@ -1953,10 +2057,16 @@ impl VideoEditorApp {
             return;
         }
         for frame in frames {
-            if frame.generation != self.preview_generation {
-                self.preview_worker.recycle(frame.rgb);
+            // Drop frames from before a structural project change, and never let a slow
+            // decode overwrite a fresher frame (rapid scrubbing). request_seq is monotonic
+            // per request batch, so "older than the last accepted" is a simple comparison.
+            if frame.generation != self.preview_generation
+                || frame.request_seq < self.preview_frame_seq
+            {
+                self.preview_worker.recycle(frame.pixels);
                 continue;
             }
+            self.preview_frame_seq = frame.request_seq;
             self.preview_qsv_active = frame.qsv_active;
             if let Some(error) = frame.error {
                 // Drop any stale frame so the message is actually visible instead of an old picture.
@@ -1967,12 +2077,13 @@ impl VideoEditorApp {
                 if self.preview_main_clip == Some(frame.clip_id) {
                     self.preview_error = Some(error);
                 }
-                self.preview_worker.recycle(frame.rgb);
+                self.preview_worker.recycle(frame.pixels);
                 continue;
             }
-            let image = ColorImage::from_rgb([frame.width, frame.height], &frame.rgb);
+            let image =
+                ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &frame.pixels);
             // The pixels now live in the texture; return the decode buffer for reuse.
-            self.preview_worker.recycle(frame.rgb);
+            self.preview_worker.recycle(frame.pixels);
             if let Some(texture) = self.preview_textures.get_mut(&frame.clip_id) {
                 texture.set(image, TextureOptions::LINEAR);
             } else {
@@ -2165,6 +2276,7 @@ impl VideoEditorApp {
                 UiAction::CancelAnalysis => self.cancel_analysis(),
                 UiAction::ExportVir => self.export_vir(),
                 UiAction::ClearAnalysisCache => self.clear_analysis_cache(),
+                UiAction::ExportThumbnail => self.export_thumbnail(&context),
                 UiAction::TestModelConnection => self.test_model_connection(context),
                 UiAction::GenerateEmbeddings => self.start_embeddings(context),
                 UiAction::CancelEmbeddings => self.cancel_embeddings(),
@@ -2504,27 +2616,38 @@ impl VideoEditorApp {
     }
 
     fn shortcuts(&mut self, context: &egui::Context) {
+        // Text fields must keep their own keys (caret movement, deletion, text undo). These
+        // shortcuts run before any widget sees the events, so consuming them unconditionally
+        // would silently swallow them mid-sentence — and Ctrl+Z would undo the timeline while
+        // the user is editing text.
+        //
+        // `text_edit_focused` rather than `egui_wants_keyboard_input`: every clickable widget
+        // is focusable in egui, so after clicking a clip or a button the whole app would lose
+        // Space/arrows otherwise.
+        let text_edit_focused = context.text_edit_focused();
         if context.input_mut(|input| {
             input.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::S))
         }) {
             self.save_project(false);
         }
-        if context.input_mut(|input| {
-            input.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::Z))
-        }) {
-            self.undo();
-        }
-        if context.input_mut(|input| {
-            input.consume_shortcut(&KeyboardShortcut::new(
-                Modifiers::CTRL | Modifiers::SHIFT,
-                Key::Z,
-            ))
-        }) {
-            self.redo();
+        if !text_edit_focused {
+            if context.input_mut(|input| {
+                input.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::Z))
+            }) {
+                self.undo();
+            }
+            if context.input_mut(|input| {
+                input.consume_shortcut(&KeyboardShortcut::new(
+                    Modifiers::CTRL | Modifiers::SHIFT,
+                    Key::Z,
+                ))
+            }) {
+                self.redo();
+            }
         }
         // Ctrl+C/V must stay available to focused text fields (inspector, VOICEVOX, chat, ...)
         // so their OS clipboard still works; only consume them outside text input.
-        if !context.egui_wants_keyboard_input() {
+        if !text_edit_focused {
             if context.input_mut(|input| {
                 input.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::C))
             }) {
@@ -2536,24 +2659,26 @@ impl VideoEditorApp {
                 self.paste_clipboard();
             }
         }
-        if context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Space)) {
-            self.toggle_playback();
-        }
-        if context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Delete)) {
-            self.delete_selected();
-        }
-        if context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowRight)) {
-            self.step_frame(1);
-        }
-        if context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowLeft)) {
-            self.step_frame(-1);
-        }
-        if context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Home)) {
-            self.seek_to(TimelineTime::ZERO);
-        }
-        if context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::End)) {
-            let duration = self.project.duration();
-            self.seek_to(duration);
+        if !text_edit_focused {
+            if context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Space)) {
+                self.toggle_playback();
+            }
+            if context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Delete)) {
+                self.delete_selected();
+            }
+            if context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowRight)) {
+                self.step_frame(1);
+            }
+            if context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::ArrowLeft)) {
+                self.step_frame(-1);
+            }
+            if context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Home)) {
+                self.seek_to(TimelineTime::ZERO);
+            }
+            if context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::End)) {
+                let duration = self.project.duration();
+                self.seek_to(duration);
+            }
         }
     }
 }
@@ -2562,6 +2687,7 @@ impl eframe::App for VideoEditorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
         self.poll_export(&context);
+        self.poll_thumbnail();
         self.poll_voicevox(&context);
         self.poll_hardware();
         self.poll_fonts();
@@ -2628,6 +2754,23 @@ impl eframe::App for VideoEditorApp {
                             }
                         }
                     }
+                    ui.separator();
+                    ui.menu_button("テーマ", |ui| {
+                        for (theme, label) in AppTheme::MENU {
+                            if ui
+                                .selectable_label(self.app_theme == theme, label)
+                                .clicked()
+                            {
+                                self.app_theme = theme;
+                                // ランダムカラーは選択中でも再クリックで配色を引き直す。
+                                if theme == AppTheme::RandomColor {
+                                    self.random_theme_seed = roll_random_seed();
+                                }
+                                context
+                                    .set_visuals(build_visuals(self.app_theme, self.random_theme_seed));
+                            }
+                        }
+                    });
                 });
                 ui.separator();
                 if ui
@@ -2697,16 +2840,28 @@ impl eframe::App for VideoEditorApp {
                     ui.label("話者");
                     ui.add(egui::DragValue::new(&mut self.voicevox_speaker).range(1..=100));
                 }
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.voicevox_text)
-                        // A stable id keeps focus (and the IME) across layout changes.
-                        .id_salt("voicevox_line")
-                        .hint_text("読み上げるテキストを入力（Enterで追加）")
-                        .desired_width(260.0),
-                );
+                let response = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.voicevox_text)
+                            // A stable id keeps focus (and the IME) across layout changes.
+                            .id_salt("voicevox_line")
+                            .hint_text("読み上げるテキストを入力（Enterで追加）")
+                            .desired_width(260.0),
+                    )
+                    .on_hover_text("Escで入力リセット（IMEが文字を渡さなくなったとき）");
                 // Enter submits the line, matching the AI chat composer.
                 let submitted =
                     response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                // Esc blurs the field at the start of the frame (egui does that for us). Taking
+                // the focus back within the same frame leaves the IME disabled for exactly one
+                // frame, which forces the compositor to enable it again — the no-restart
+                // recovery when a Japanese IME stops committing text into a focused field.
+                // `had_focus_last_frame` keeps this from stealing focus back from a neighbour
+                // when the field was already left some frames ago.
+                let reset_input = response.ctx.memory(|memory| {
+                    memory.had_focus_last_frame(response.id)
+                        && ui.input(|input| input.key_pressed(egui::Key::Escape))
+                });
                 let busy = self.voicevox_receiver.is_some();
                 let can_add = !busy && !self.voicevox_text.trim().is_empty();
                 let clicked = ui.add_enabled(can_add, egui::Button::new("生成")).clicked();
@@ -2716,7 +2871,9 @@ impl eframe::App for VideoEditorApp {
                 // A single-line `TextEdit` always drops focus on Enter (and clicking the button
                 // moves it), so take it back: otherwise the next line cannot be typed without
                 // clicking the box again, and the Japanese IME has to be re-enabled each time.
-                if submitted || clicked {
+                // Requesting focus while it is already held would interrupt an in-progress IME
+                // composition, so only take it back when it is actually gone.
+                if (submitted || clicked || reset_input) && !response.has_focus() {
                     response.request_focus();
                 }
                 if busy {
@@ -2789,6 +2946,8 @@ impl eframe::App for VideoEditorApp {
         eframe::set_value(storage, "analysis_options", &self.analysis.options);
         eframe::set_value(storage, "model_config", &self.analysis.semantic.config);
         eframe::set_value(storage, "chat_config", &self.analysis.chat.config);
+        eframe::set_value(storage, "app_theme", &self.app_theme);
+        eframe::set_value(storage, "random_theme_seed", &self.random_theme_seed);
     }
 }
 

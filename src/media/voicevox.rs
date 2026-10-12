@@ -54,8 +54,20 @@ pub fn synthesize(
         "{base}/audio_query?text={}&speaker={speaker_id}",
         url_encode(text)
     );
+    // Timeouts matter twice over: a hung engine must not pin this worker thread forever, and a
+    // blocked agent speech call keeps the whole chat marked "waiting".
     let query = Command::new("curl")
-        .args(["-sS", "--fail", "-X", "POST", &query_url])
+        .args([
+            "-sS",
+            "--fail",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "120",
+            "-X",
+            "POST",
+            &query_url,
+        ])
         .output()?;
     if !query.status.success() {
         return Err(VoicevoxError::AudioQuery(command_error(&query)));
@@ -71,6 +83,10 @@ pub fn synthesize(
         .args([
             "-sS",
             "--fail",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "120",
             "-X",
             "POST",
             &synthesis_url,

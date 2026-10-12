@@ -8,7 +8,7 @@ mod voicevox;
 
 pub use audio::AudioPreview;
 pub use export::{
-    AudioCodec, EncoderPreset, ExportError, ExportOptions, VideoEncoder,
+    AudioCodec, EncoderPreset, ExportError, ExportOptions, VideoEncoder, export_frame_png,
     export_project_with_options,
 };
 pub use fonts::{
